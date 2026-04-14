@@ -1,123 +1,32 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { v4 as uuidv4 } from 'uuid';
 import { db, type ChatMessage } from '../db';
 import { useLeader } from '../hooks/useLeader';
+import { useChatSync } from '../hooks/useChatSync';
 
 interface Props {
   currentUser: string;
 }
 
+// 跨視窗廣播频道，用來通知 Leader 立刻同步
+const syncChannel = new BroadcastChannel('chat_sync_pokes');
+
 const ChatRoom: React.FC<Props> = ({ currentUser }) => {
   const [inputText, setInputText] = useState('');
   const messages = useLiveQuery(() => db.messages.orderBy('timestamp').toArray());
   const isLeader = useLeader();
-  const wsRef = useRef<WebSocket | null>(null);
+  
+  // 注入同步邏輯 Hook
+  const { syncLocalMessages } = useChatSync(isLeader);
 
-  useEffect(() => {
-    console.log('收到 message 了', messages);
-  }, [messages]);
-
-  const isSyncingRef = useRef(false);
-  const needsSyncAgainRef = useRef(false);
-
-  // --- Leader 專屬邏輯：WebSocket 同步 (具備防重發與連續處理機制) ---
-  const syncLocalMessages = async () => {
-    if (!isLeader || wsRef.current?.readyState !== WebSocket.OPEN) return;
-
-    // 如果正在同步中，標記「待會要再跑一次」並直接返回
-    if (isSyncingRef.current) {
-      needsSyncAgainRef.current = true;
-      return;
-    }
-
-    isSyncingRef.current = true;
-    try {
-      // 迴圈處理：只要標記了需要再次同步，就繼續執行
-      do {
-        needsSyncAgainRef.current = false;
-        
-        // 1. 找出所有狀態為 'local' 的訊息
-        const unsyncedMessages = await db.messages.where('status').equals('local').toArray();
-        
-        if (unsyncedMessages.length > 0) {
-          console.log(`Leader 正在同步 ${unsyncedMessages.length} 筆訊息...`);
-          for (const msg of unsyncedMessages) {
-            wsRef.current.send(JSON.stringify(msg));
-            await db.messages.update(msg.id, { status: 'synced' });
-          }
-        }
-      } while (needsSyncAgainRef.current); // 如果處理期間又有新的 Poke，就再跑一圈
-      
-    } catch (err) {
-      console.error('同步過程發生錯誤:', err);
-    } finally {
-      isSyncingRef.current = false;
-    }
-  };
-
+  // 監聽來自其他視窗的同步請求
   useEffect(() => {
     if (!isLeader) return;
-
-    console.log('Leader 正在建立 WebSocket 連線...');
-    const ws = new WebSocket('ws://localhost:8080');
-    wsRef.current = ws;
-
-    ws.onopen = async () => {
-      console.log('WebSocket 已連線');
-      
-      // --- 歷史補回 (History Catch-up) ---
-      // 找出本地最後一筆訊息的時間戳
-      const lastMsg = await db.messages.orderBy('timestamp').reverse().limit(1).toArray();
-      const lastTimestamp = lastMsg.length > 0 ? lastMsg[0].timestamp : 0;
-      
-      console.log(`向伺服器請求補回訊息，從 ${lastTimestamp} 開始...`);
-      ws.send(JSON.stringify({ type: 'SYNC_REQUEST', lastTimestamp }));
-
-      // 同時也補發本地 local 訊息
-      syncLocalMessages();
+    syncChannel.onmessage = (event) => {
+      if (event.data === 'POKE_LEADER') syncLocalMessages();
     };
-
-    ws.onmessage = async (event) => {
-      try {
-        const data = JSON.parse(event.data);
-
-        // 如果是補回訊息的回應
-        if (data.type === 'SYNC_RESPONSE') {
-          console.log(`補回了 ${data.messages.length} 筆訊息`);
-          for (const msg of data.messages) {
-            const exists = await db.messages.get(msg.id);
-            if (!exists) await db.messages.put({ ...msg, status: 'synced' });
-          }
-          return;
-        }
-
-        // 正常的聊天訊息
-        const receivedMsg: ChatMessage = data;
-        const exists = await db.messages.get(receivedMsg.id);
-        if (!exists) {
-          await db.messages.put({ ...receivedMsg, status: 'synced' });
-        }
-      } catch (err) {
-        console.error('解析 WebSocket 訊息失敗:', err);
-      }
-    };
-
-    ws.onclose = () => console.log('WebSocket 已斷開');
-
-    return () => {
-      ws.close();
-      wsRef.current = null;
-    };
-  }, [isLeader]);
-
-  // --- Leader 專屬邏輯：定期檢查 (作為保險) ---
-  useEffect(() => {
-    if (!isLeader) return;
-
-    const interval = setInterval(syncLocalMessages, 2000); // 降低頻率，主要靠連線時觸發
-    return () => clearInterval(interval);
-  }, [isLeader]);
+  }, [isLeader, syncLocalMessages]);
 
   const sendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -128,11 +37,11 @@ const ChatRoom: React.FC<Props> = ({ currentUser }) => {
       sender: currentUser,
       content: inputText.trim(),
       timestamp: Date.now(),
-      status: 'local', // 初始設為 local
+      status: 'local',
     };
 
-    // 所有人都是直接寫入資料庫
     await db.messages.add(newMsg);
+    syncChannel.postMessage('POKE_LEADER'); // 戳一下 Leader (如果有)
     setInputText('');
   };
 
