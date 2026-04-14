@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useCallback } from 'react';
 import { db, type ChatMessage } from '../db';
 
 /**
@@ -9,8 +9,8 @@ export function useChatSync(isLeader: boolean) {
   const isSyncingRef = useRef(false);
   const needsSyncAgainRef = useRef(false);
 
-  // --- 同步核心邏輯 ---
-  const syncLocalMessages = async () => {
+  // --- 同步核心邏輯 (使用 useCallback 確保穩定性) ---
+  const syncLocalMessages = useCallback(async () => {
     if (!isLeader || wsRef.current?.readyState !== WebSocket.OPEN) return;
 
     if (isSyncingRef.current) {
@@ -36,7 +36,7 @@ export function useChatSync(isLeader: boolean) {
     } finally {
       isSyncingRef.current = false;
     }
-  };
+  }, [isLeader]);
 
   // --- WebSocket 生命週期 ---
   useEffect(() => {
