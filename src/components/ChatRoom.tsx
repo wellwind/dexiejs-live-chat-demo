@@ -18,17 +18,31 @@ const ChatRoom: React.FC<Props> = ({ currentUser }) => {
     console.log('收到 message 了', messages);
   }, [messages]);
 
-  // --- Leader 專屬邏輯：WebSocket 同步 ---
+  const isSyncingRef = useRef(false);
+
+  // --- Leader 專屬邏輯：WebSocket 同步 (具備防重發機制) ---
   const syncLocalMessages = async () => {
-    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+    if (!isLeader || isSyncingRef.current || wsRef.current?.readyState !== WebSocket.OPEN) return;
     
-    const unsyncedMessages = await db.messages.where('status').equals('local').toArray();
-    if (unsyncedMessages.length > 0) {
-      console.log(`Leader 正在補發 ${unsyncedMessages.length} 筆訊息...`);
-      for (const msg of unsyncedMessages) {
-        wsRef.current.send(JSON.stringify(msg));
-        await db.messages.update(msg.id, { status: 'synced' });
+    isSyncingRef.current = true;
+    try {
+      // 1. 找出所有狀態為 'local' 的訊息
+      const unsyncedMessages = await db.messages.where('status').equals('local').toArray();
+      
+      if (unsyncedMessages.length > 0) {
+        console.log(`Leader 正在同步 ${unsyncedMessages.length} 筆訊息...`);
+        
+        for (const msg of unsyncedMessages) {
+          // 2. 先將狀態改為 'synced' (這裡採樂觀同步，若失敗後端歷史補回會救回)
+          // 或者更嚴謹可以用 'syncing'，但為了 Demo 簡潔我們直接 atomic 更新
+          wsRef.current.send(JSON.stringify(msg));
+          await db.messages.update(msg.id, { status: 'synced' });
+        }
       }
+    } catch (err) {
+      console.error('同步過程發生錯誤:', err);
+    } finally {
+      isSyncingRef.current = false;
     }
   };
 
