@@ -39,15 +39,37 @@ const ChatRoom: React.FC<Props> = ({ currentUser }) => {
     const ws = new WebSocket('ws://localhost:8080');
     wsRef.current = ws;
 
-    ws.onopen = () => {
+    ws.onopen = async () => {
       console.log('WebSocket 已連線');
-      // 連線成功立刻補發訊息
+      
+      // --- 歷史補回 (History Catch-up) ---
+      // 找出本地最後一筆訊息的時間戳
+      const lastMsg = await db.messages.orderBy('timestamp').reverse().limit(1).toArray();
+      const lastTimestamp = lastMsg.length > 0 ? lastMsg[0].timestamp : 0;
+      
+      console.log(`向伺服器請求補回訊息，從 ${lastTimestamp} 開始...`);
+      ws.send(JSON.stringify({ type: 'SYNC_REQUEST', lastTimestamp }));
+
+      // 同時也補發本地 local 訊息
       syncLocalMessages();
     };
 
     ws.onmessage = async (event) => {
       try {
-        const receivedMsg: ChatMessage = JSON.parse(event.data);
+        const data = JSON.parse(event.data);
+
+        // 如果是補回訊息的回應
+        if (data.type === 'SYNC_RESPONSE') {
+          console.log(`補回了 ${data.messages.length} 筆訊息`);
+          for (const msg of data.messages) {
+            const exists = await db.messages.get(msg.id);
+            if (!exists) await db.messages.put({ ...msg, status: 'synced' });
+          }
+          return;
+        }
+
+        // 正常的聊天訊息
+        const receivedMsg: ChatMessage = data;
         const exists = await db.messages.get(receivedMsg.id);
         if (!exists) {
           await db.messages.put({ ...receivedMsg, status: 'synced' });
