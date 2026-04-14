@@ -19,6 +19,19 @@ const ChatRoom: React.FC<Props> = ({ currentUser }) => {
   }, [messages]);
 
   // --- Leader 專屬邏輯：WebSocket 同步 ---
+  const syncLocalMessages = async () => {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+    
+    const unsyncedMessages = await db.messages.where('status').equals('local').toArray();
+    if (unsyncedMessages.length > 0) {
+      console.log(`Leader 正在補發 ${unsyncedMessages.length} 筆訊息...`);
+      for (const msg of unsyncedMessages) {
+        wsRef.current.send(JSON.stringify(msg));
+        await db.messages.update(msg.id, { status: 'synced' });
+      }
+    }
+  };
+
   useEffect(() => {
     if (!isLeader) return;
 
@@ -26,10 +39,15 @@ const ChatRoom: React.FC<Props> = ({ currentUser }) => {
     const ws = new WebSocket('ws://localhost:8080');
     wsRef.current = ws;
 
+    ws.onopen = () => {
+      console.log('WebSocket 已連線');
+      // 連線成功立刻補發訊息
+      syncLocalMessages();
+    };
+
     ws.onmessage = async (event) => {
       try {
         const receivedMsg: ChatMessage = JSON.parse(event.data);
-        // 檢查訊息是否已存在，避免重複寫入
         const exists = await db.messages.get(receivedMsg.id);
         if (!exists) {
           await db.messages.put({ ...receivedMsg, status: 'synced' });
@@ -39,7 +57,6 @@ const ChatRoom: React.FC<Props> = ({ currentUser }) => {
       }
     };
 
-    ws.onopen = () => console.log('WebSocket 已連線');
     ws.onclose = () => console.log('WebSocket 已斷開');
 
     return () => {
@@ -48,24 +65,11 @@ const ChatRoom: React.FC<Props> = ({ currentUser }) => {
     };
   }, [isLeader]);
 
-  // --- Leader 專屬邏輯：監聽 Dexie 變動並補發給 WS ---
+  // --- Leader 專屬邏輯：定期檢查 (作為保險) ---
   useEffect(() => {
     if (!isLeader) return;
 
-    // 這裡我們訂閱 Dexie，找出所有狀態為 'local' 的訊息並同步
-    const interval = setInterval(async () => {
-      const unsyncedMessages = await db.messages.where('status').equals('local').toArray();
-      
-      if (unsyncedMessages.length > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
-        for (const msg of unsyncedMessages) {
-          console.log('同步訊息到後端:', msg.content);
-          wsRef.current.send(JSON.stringify(msg));
-          // 更新狀態為已同步
-          await db.messages.update(msg.id, { status: 'synced' });
-        }
-      }
-    }, 1000); // 每一秒掃描一次
-
+    const interval = setInterval(syncLocalMessages, 2000); // 降低頻率，主要靠連線時觸發
     return () => clearInterval(interval);
   }, [isLeader]);
 
